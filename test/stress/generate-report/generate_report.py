@@ -21,6 +21,7 @@ import shutil
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
+from download_results import node_profile_files
 import duckdb
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -1347,6 +1348,22 @@ def main():
         shutil.copy(f, output_dir / f.name)
         print(f"Copied CPU profile: {output_dir / f.name}")
 
+    node_profiles = []
+    manifest = input_dir / "node-profiles.json"
+    if manifest.exists():
+        node_profiles = json.loads(manifest.read_text())
+        for record in node_profiles:
+            available = []
+            for filename in node_profile_files([record]):
+                source = input_dir / filename
+                if source.is_file():
+                    shutil.copy(source, output_dir / filename)
+                    available.append(filename)
+                else:
+                    record["error"] = f"{record.get('error', '')} Missing artifact: {filename}".strip()
+            record["files"] = available
+        shutil.copy(manifest, output_dir / manifest.name)
+
     # Copy the watch stream so watch.html can fetch and parse it client-side.
     # Always name the copy watch.jsonl, even when the input is watch.jsonl.gz:
     # prow's GCS artifact uploader strips a .gz suffix on upload (the run
@@ -1481,7 +1498,8 @@ def main():
     pprof_ctx = {
         "active_page": "pprof",
         "summary": summary,
-        "pprof_profiles": pprof_profiles
+        "pprof_profiles": pprof_profiles,
+        "node_profiles": node_profiles
     }
     render_page("pprof.html", "pprof.html", pprof_ctx)
 

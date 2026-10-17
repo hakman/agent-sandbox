@@ -217,6 +217,9 @@ type Config struct {
 	// profiles DURING the claims-warm burst (pprof-controller-*.pprof);
 	// requires the controller to run with --enable-pprof / --enable-pprof-debug.
 	ProfileController bool `json:"profileController"`
+
+	// ProfileNode selects one worker for CNI/runtime profiles; empty disables capture.
+	ProfileNode string `json:"profileNode,omitempty"`
 }
 
 // GVRs shared by the watchers and the claims-warm phase (the extension GVRs
@@ -269,6 +272,7 @@ func run(ctx context.Context) error {
 	flag.DurationVar(&cfg.MetricsInterval, "metrics-interval", 15*time.Second, "Interval between Prometheus metrics scrapes")
 	flag.BoolVar(&cfg.ProfileAPIServer, "profile-apiserver", true, "Capture a kube-apiserver CPU profile during each throughput level (pprof-apiserver-<phase>.pprof)")
 	flag.BoolVar(&cfg.ProfileController, "profile-controller", true, "Capture agent-sandbox-controller CPU+heap profiles during the claims-warm burst (best-effort; the controller must run with --enable-pprof / --enable-pprof-debug)")
+	flag.StringVar(&cfg.ProfileNode, "profile-node", "", "Profile CNI/runtime startup during throughput phases on a Linux worker (node name or auto; requires privileged pods and containerd debug socket)")
 	flag.Parse()
 
 	for part := range strings.SplitSeq(*phasesFlag, ",") {
@@ -286,6 +290,9 @@ func run(ctx context.Context) error {
 	phases, err := parsePhases(cfg.Phases, cfg)
 	if err != nil {
 		return err
+	}
+	if cfg.ProfileNode != "" && !slices.ContainsFunc(phases, func(p Phase) bool { return p.Kind() == PhaseThroughput }) {
+		return fmt.Errorf("--profile-node requires a throughput phase")
 	}
 	if cfg.Timeout <= 0 || cfg.PerSandboxTimeout <= 0 {
 		return fmt.Errorf("timeouts must be > 0: timeout=%v per-sandbox-timeout=%v", cfg.Timeout, cfg.PerSandboxTimeout)
@@ -358,6 +365,16 @@ func run(ctx context.Context) error {
 	if minConns := (burstWidth + 99) / 100; cfg.ClientConnections < minConns {
 		log.Printf("WARNING: --client-connections=%d < ceil(max create burst %d / 100)=%d — create-ack latency will include client-side HTTP/2 stream queueing",
 			cfg.ClientConnections, burstWidth, minConns)
+	}
+
+	var nodeProfiler *nodeProfiler
+	if cfg.ProfileNode != "" {
+		nodeProfiler, err = newNodeProfiler(ctx, restConfig, cfg.ProfileNode, cfg.OutputDir)
+		if err != nil {
+			return fmt.Errorf("preparing node profiling: %w", err)
+		}
+		defer nodeProfiler.Close()
+		cfg.ProfileNode = nodeProfiler.node
 	}
 
 	clusterInfo, err := inspectCluster(ctx, restConfig, dynamicClient)
@@ -546,16 +563,20 @@ func run(ctx context.Context) error {
 			name:   phase.Name(),
 			offset: time.Since(testStartTime),
 		}
+		finishProfile := func() error { return nil }
+		if nodeProfiler != nil && phase.Kind() == PhaseThroughput {
+			finishProfile = nodeProfiler.startPhase(ctx, phase.Name(), number, 5*time.Second)
+		}
 		start := time.Now()
-		if err := phase.Run(ctx, test, number); err != nil {
-			result.duration = time.Since(start)
-			phaseResults = append(phaseResults, result)
+		runErr := phase.Run(ctx, test, number)
+		result.duration = time.Since(start)
+		phaseResults = append(phaseResults, result)
+		// Artifact transfer must not inflate the phase's measured duration.
+		if err := errors.Join(runErr, finishProfile()); err != nil {
 			phaseErr = fmt.Errorf("%s#%d phase: %w", phase.Name(), number, err)
 			log.Printf("aborting after error: %v", phaseErr)
 			break
 		}
-		result.duration = time.Since(start)
-		phaseResults = append(phaseResults, result)
 	}
 
 	// Give the watchers a moment to observe trailing events.

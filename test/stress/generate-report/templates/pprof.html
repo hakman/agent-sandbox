@@ -21,11 +21,28 @@
 {% block header_title %}CPU Profiles (Flame Graphs){% endblock %}
 
 {% block content %}
+{% if node_profiles %}
+<div class="card">
+    <div class="card-title">Node startup profiles</div>
+    <p>CPU samples, scheduler waits and syscall timings cover CNI, containerd and runtime children on one worker.
+       Times are aggregated across threads and overlap; they are not additive sandbox latency.
+       The metadata file records the capture window. Open containerd execution traces with <code>go tool trace</code>.</p>
+    <ul>
+    {% for p in node_profiles %}
+        <li>{{ p.phase }} #{{ p.phaseNumber }} on {{ p.node }}
+            {% if p.interrupted %} — interrupted at phase end{% endif %}
+            {% if p.error %} — {{ p.error }}{% endif %}
+            <ul>{% for file in p.files %}<li><a href="{{ file }}">{{ file }}</a></li>{% endfor %}</ul>
+        </li>
+    {% endfor %}
+    </ul>
+</div>
+{% endif %}
 {% if pprof_profiles %}
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/d3-flame-graph@4/dist/d3-flamegraph.css">
 <div class="card">
     <div class="card-title">
-        <span>kube-apiserver CPU profile</span>
+        <span>CPU profile</span>
         <span>
             <span class="badge badge-search" id="profile-search-info" hidden></span>
             <span class="badge badge-zoom" id="profile-zoom-info" hidden></span>

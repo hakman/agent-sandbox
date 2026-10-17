@@ -324,6 +324,12 @@ if [[ "${CNI}" == "cilium" ]]; then
     --set cluster.spec.networking.cilium.enablePrometheusMetrics=true
 fi
 
+# Node profiling is opt-in and uses a node-local Unix socket.
+if [[ -n "${STRESS_PROFILE_NODE:-}" ]]; then
+  kops edit cluster --name "${CLUSTER_NAME}" \
+    --set 'spec.containerd.configAdditions=debug.address=/run/containerd/debug.sock'
+fi
+
 echo "Applying cluster configuration..."
 kops update cluster --name "${CLUSTER_NAME}" --yes
 
@@ -470,6 +476,7 @@ go run ./test/stress \
   --claims-warm-count="${STRESS_CLAIMS_WARM:-300}" \
   --timeout="${STRESS_TIMEOUT:-30m}" \
   --output-dir="${STRESS_OUTPUT_DIR}" \
+  --profile-node="${STRESS_PROFILE_NODE:-}" \
   ${STRESS_EXTRA_ARGS:-}
 stress_status=$?
 set -o errexit

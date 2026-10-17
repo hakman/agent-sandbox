@@ -32,7 +32,8 @@ EXPECTED_FILES = [
     "controller.log",
     "pods.txt",
     "nodes.txt",
-    "top-nodes.txt"
+    "top-nodes.txt",
+    "node-profiles.json"
 ]
 
 def normalize_url(url):
@@ -95,6 +96,14 @@ def download_file(url, out_path):
     print(f"-> Saved to {final_path}")
     return True
 
+def node_profile_files(records):
+    """Only accept flat artifact names from the capture manifest."""
+    for record in records:
+        for name in record.get("files", []):
+            if not re.fullmatch(r"(?:node-profile-|pprof-containerd-)[A-Za-z0-9_.-]+", name):
+                raise ValueError(f"Invalid node profile artifact: {name!r}")
+            yield name
+
 def main():
     parser = argparse.ArgumentParser(description="Download stress test artifacts from GCS and restore .gz extensions.")
     parser.add_argument("--url", required=True, help="GCS folder URL (gs://... or https://gcsweb.k8s.io/... or https://storage.googleapis.com/...)")
@@ -119,6 +128,11 @@ def main():
     for filename in EXPECTED_FILES:
         for stale in (output_dir / filename, output_dir / (filename + '.gz')):
             stale.unlink(missing_ok=True)
+
+    for pattern in ("node-profile-*", "pprof-containerd-*"):
+        for stale in output_dir.glob(pattern):
+            if stale.is_file():
+                stale.unlink()
 
     downloaded = 0
     for filename in EXPECTED_FILES:
@@ -149,6 +163,12 @@ def main():
                 if download_file(f"{base_url}/{candidate}", out_file_path):
                     downloaded += 1
                     break
+
+    manifest = output_dir / "node-profiles.json"
+    if manifest.exists():
+        for filename in node_profile_files(json.loads(manifest.read_text())):
+            if download_file(f"{base_url}/{filename}", output_dir / filename):
+                downloaded += 1
 
     print(f"\nCompleted downloading {downloaded} files successfully.")
 

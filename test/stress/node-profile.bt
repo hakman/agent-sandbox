@@ -1,0 +1,139 @@
+// Copyright 2026 The Kubernetes Authors.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+
+// CPU samples and scheduler waits include runtime children that containerd's
+// Go profile cannot see. Wakeup timestamps separate blocked time from runqueue delay.
+profile:hz:49
+/@begin && (comm == "containerd" || comm == "containerd-shim" || comm == "cilium-cni" ||
+ comm == "cilium-agent" || comm == "cni-kindnet" || comm == "loopback" || strncmp(comm, "runc", 4) == 0)/
+{
+  @cpu_samples[comm, ustack(24), kstack(24)] = count();
+}
+
+tracepoint:sched:sched_switch
+/@begin/
+{
+  if (args->prev_comm == "containerd" || args->prev_comm == "containerd-shim" ||
+      args->prev_comm == "cilium-cni" || args->prev_comm == "cilium-agent" ||
+      args->prev_comm == "cni-kindnet" || args->prev_comm == "loopback" || strncmp(args->prev_comm, "runc", 4) == 0) {
+    @off_start[args->prev_pid] = nsecs;
+    @off_comm[args->prev_pid] = args->prev_comm;
+    @off_state[args->prev_pid] = args->prev_state;
+    @off_user[args->prev_pid] = ustack(24);
+    @off_kernel[args->prev_pid] = kstack(24);
+  }
+  if (@off_start[args->next_pid]) {
+    $tid = args->next_pid;
+    // sched_switch uses 0x100 to mark preemption on current Linux kernels.
+    if (@off_state[$tid] == 0 || @off_state[$tid] == 256) {
+      @runqueue_ns[@off_comm[$tid], @off_user[$tid], @off_kernel[$tid]] = sum(nsecs - @off_start[$tid]);
+    } else if (@wakeup[$tid]) {
+      @blocked_ns[@off_comm[$tid], @off_user[$tid], @off_kernel[$tid]] = sum(@wakeup[$tid] - @off_start[$tid]);
+      @runqueue_ns[@off_comm[$tid], @off_user[$tid], @off_kernel[$tid]] = sum(nsecs - @wakeup[$tid]);
+    } else {
+      @unclassified_offcpu_ns[@off_comm[$tid], @off_state[$tid]] = sum(nsecs - @off_start[$tid]);
+    }
+    delete(@wakeup[$tid]);
+    delete(@off_start[$tid]);
+    delete(@off_comm[$tid]);
+    delete(@off_state[$tid]);
+    delete(@off_user[$tid]);
+    delete(@off_kernel[$tid]);
+  }
+}
+
+tracepoint:sched:sched_wakeup
+/@off_start[args->pid] && !@wakeup[args->pid]/
+{
+  @wakeup[args->pid] = nsecs;
+}
+
+tracepoint:syscalls:sys_enter_fsync,
+tracepoint:syscalls:sys_enter_fdatasync,
+tracepoint:syscalls:sys_enter_sendto,
+tracepoint:syscalls:sys_enter_recvfrom,
+tracepoint:syscalls:sys_enter_sendmsg,
+tracepoint:syscalls:sys_enter_recvmsg,
+tracepoint:syscalls:sys_enter_connect,
+tracepoint:syscalls:sys_enter_setns,
+tracepoint:syscalls:sys_enter_unshare,
+tracepoint:syscalls:sys_enter_mount
+/@begin && (comm == "containerd" || comm == "containerd-shim" || comm == "cilium-cni" ||
+ comm == "cni-kindnet" || comm == "loopback" || strncmp(comm, "runc", 4) == 0)/
+{
+  @syscall_start[tid] = nsecs;
+}
+
+tracepoint:syscalls:sys_exit_fsync,
+tracepoint:syscalls:sys_exit_fdatasync,
+tracepoint:syscalls:sys_exit_sendto,
+tracepoint:syscalls:sys_exit_recvfrom,
+tracepoint:syscalls:sys_exit_sendmsg,
+tracepoint:syscalls:sys_exit_recvmsg,
+tracepoint:syscalls:sys_exit_connect,
+tracepoint:syscalls:sys_exit_setns,
+tracepoint:syscalls:sys_exit_unshare,
+tracepoint:syscalls:sys_exit_mount
+/@syscall_start[tid]/
+{
+  @syscall_ns[comm, probe] = stats(nsecs - @syscall_start[tid]);
+  delete(@syscall_start[tid]);
+}
+
+tracepoint:sched:sched_process_exec
+/@begin && (comm == "cilium-cni" || comm == "cni-kindnet" || comm == "loopback" || strncmp(comm, "runc", 4) == 0)/
+{
+  if (!@exec_start[pid]) {
+    @exec_start[pid] = nsecs;
+    @exec_comm[pid] = comm;
+  }
+}
+
+tracepoint:sched:sched_process_exit
+{
+  if (pid == tid && @exec_start[pid]) {
+    @process_lifetime_ns[@exec_comm[pid]] = stats(nsecs - @exec_start[pid]);
+    delete(@exec_start[pid]);
+    delete(@exec_comm[pid]);
+  }
+  delete(@wakeup[tid]);
+  delete(@off_start[tid]);
+  delete(@off_comm[tid]);
+  delete(@off_state[tid]);
+  delete(@off_user[tid]);
+  delete(@off_kernel[tid]);
+  delete(@syscall_start[tid]);
+}
+
+// BEGIN runs before probe attachment. An interval event is delivered once
+// attachment has completed, so the caller can safely start other captures.
+interval:s:1
+{
+  if (!@begin) {
+    @begin = nsecs;
+    printf("STRESS_PROFILE_READY mono_ns=%llu\n", nsecs);
+  } else if (nsecs - @begin >= (uint64)$1 * 1000000000) {
+    exit();
+  }
+}
+
+END
+{
+  printf("STRESS_PROFILE_END mono_ns=%llu\n", nsecs);
+  clear(@begin); clear(@wakeup);
+  clear(@off_start); clear(@off_comm); clear(@off_state);
+  clear(@off_user); clear(@off_kernel); clear(@syscall_start);
+  clear(@exec_start); clear(@exec_comm);
+}
