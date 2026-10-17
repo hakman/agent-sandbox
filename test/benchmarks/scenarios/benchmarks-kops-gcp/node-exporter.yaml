@@ -22,7 +22,7 @@
 # control-plane CPU starvation is precisely the condition this exists to
 # measure, so it must survive there: system-node-critical priority and a
 # small dedicated CPU request keep it scheduled and running on a saturated
-# node. Collectors are restricted to the cheap /proc + /sys ones we chart.
+# node. Collectors are restricted to cheap node-level statistics.
 #
 # cgroup accounting: pod churn leaves memory cgroups behind after their pods
 # are gone whenever charged page cache still pins them, and those dying
@@ -30,8 +30,12 @@
 # reclaimed. node-exporter has no collector for /sys/fs/cgroup/cgroup.stat,
 # so a sidecar rewrites it as node_cgroup_stat_<field> gauges for the
 # textfile collector every 15s (nr_dying_descendants; on 6.12+ kernels also
-# the per-controller nr_dying_subsys_memory). The cgroups collector adds the
-# /proc/cgroups count, which includes cgroups removed but not yet freed.
+# the per-controller nr_dying_subsys_memory). Preserve the kernel field names
+# so samples can be compared directly with cgroup.stat. Descendant counts
+# exclude the root; subsystem counts include it. These are cgroup v2 stats,
+# unlike node-exporter's legacy /proc/cgroups collector.
+# A failed or unsupported collection publishes collection_success=0 without
+# old counts. node_textfile_mtime_seconds also exposes a stalled writer.
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -65,7 +69,6 @@ spec:
             - --collector.meminfo
             - --collector.diskstats
             - --collector.loadavg
-            - --collector.cgroups
             - --collector.textfile
             - --collector.textfile.directory=/textfile
           ports:
@@ -78,9 +81,9 @@ spec:
               memory: 32Mi
             limits:
               memory: 64Mi
-          # The enabled collectors only read world-readable /proc and /sys
-          # files, so run unprivileged (matching the upstream helm chart's
-          # defaults).
+          # The enabled collectors read world-readable host files and the
+          # shared textfile volume, so run unprivileged (matching the upstream
+          # helm chart's defaults).
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -102,18 +105,27 @@ spec:
               readOnly: true
         # Same image as node-exporter (busybox based, already on the node), so
         # the sidecar costs no extra pull. cgroup.stat is world-readable.
+        # Recheck sh/awk/mv/sleep availability when changing the image.
         - name: cgroup-stat
           image: quay.io/prometheus/node-exporter:v1.8.2
           command:
             - /bin/sh
             - -c
             - |
+              set -e
+              trap 'rm -f /textfile/cgroup_stat.prom /textfile/cgroup_stat.prom.tmp' EXIT
               while true; do
-                if [ -r /host/sys/fs/cgroup/cgroup.stat ]; then
+                if [ -r /host/sys/fs/cgroup/cgroup.stat ] &&
                   awk '{ printf "# TYPE node_cgroup_stat_%s gauge\nnode_cgroup_stat_%s %s\n", $1, $1, $2 }' \
-                    /host/sys/fs/cgroup/cgroup.stat > /textfile/cgroup_stat.prom.tmp \
-                    && mv /textfile/cgroup_stat.prom.tmp /textfile/cgroup_stat.prom
+                    /host/sys/fs/cgroup/cgroup.stat > /textfile/cgroup_stat.prom.tmp; then
+                  success=1
+                else
+                  success=0
+                  : > /textfile/cgroup_stat.prom.tmp
                 fi
+                printf '# HELP node_cgroup_stat_collection_success Whether the last cgroup.stat collection succeeded.\n# TYPE node_cgroup_stat_collection_success gauge\nnode_cgroup_stat_collection_success %s\n' \
+                  "$success" >> /textfile/cgroup_stat.prom.tmp
+                mv /textfile/cgroup_stat.prom.tmp /textfile/cgroup_stat.prom
                 sleep 15
               done
           resources:
